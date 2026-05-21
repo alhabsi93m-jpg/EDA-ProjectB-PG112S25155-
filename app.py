@@ -627,7 +627,7 @@ project_card = f"""# {project_title}
 
 ## Improved feature preparation
 Feature groups:
-{group_df.to_markdown(index=False)}
+{group_df.to_string(index=False)}
 
 ## Student additions needed
 Add modeling, evaluation metrics, dashboard improvements, and written insights before final submission.
