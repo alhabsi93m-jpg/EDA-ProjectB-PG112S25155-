@@ -98,9 +98,67 @@ def clean_time_series(dataframe, timestamp_column, target_column):
     return cleaned
 
 
+def infer_time_gap_summary(dataframe, timestamp_column):
+    if len(dataframe) < 3:
+        return {
+            "median_gap_minutes": None,
+            "largest_gap_minutes": None,
+            "suspected_missing_intervals": 0,
+            "duplicate_timestamps": int(dataframe[timestamp_column].duplicated().sum()),
+        }
+
+    sorted_time = dataframe[timestamp_column].sort_values()
+    gaps = sorted_time.diff().dropna()
+    median_gap = gaps.median()
+
+    if pd.isna(median_gap) or median_gap == pd.Timedelta(0):
+        suspected_missing = 0
+    else:
+        suspected_missing = int((gaps > median_gap * 1.5).sum())
+
+    return {
+        "median_gap_minutes": float(median_gap.total_seconds() / 60) if pd.notna(median_gap) else None,
+        "largest_gap_minutes": float(gaps.max().total_seconds() / 60) if len(gaps) else None,
+        "suspected_missing_intervals": suspected_missing,
+        "duplicate_timestamps": int(dataframe[timestamp_column].duplicated().sum()),
+    }
+
+
+def target_outlier_summary(dataframe, target_column):
+    series = pd.to_numeric(dataframe[target_column], errors="coerce").dropna()
+
+    if series.empty:
+        return {
+            "q1": None,
+            "q3": None,
+            "iqr": None,
+            "lower_bound": None,
+            "upper_bound": None,
+            "outlier_count": 0,
+            "outlier_percent": 0.0,
+        }
+
+    q1 = float(series.quantile(0.25))
+    q3 = float(series.quantile(0.75))
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    outliers = ((series < lower) | (series > upper)).sum()
+
+    return {
+        "q1": q1,
+        "q3": q3,
+        "iqr": float(iqr),
+        "lower_bound": float(lower),
+        "upper_bound": float(upper),
+        "outlier_count": int(outliers),
+        "outlier_percent": float(outliers / len(series) * 100),
+    }
+
+
 def resample_time_series(dataframe, timestamp_column, target_column, rule):
     if rule == "No resampling":
-        return dataframe
+        return dataframe.copy()
 
     numeric_cols = dataframe.select_dtypes(include=[np.number]).columns.tolist()
     if target_column not in numeric_cols:
@@ -116,24 +174,98 @@ def resample_time_series(dataframe, timestamp_column, target_column, rule):
     return resampled
 
 
-def build_baseline_features(dataframe, timestamp_column, target_column, horizon):
-    feature_df = dataframe[[timestamp_column, target_column]].copy()
-    feature_df = feature_df.sort_values(timestamp_column).reset_index(drop=True)
+def add_cyclical_feature(dataframe, source_column, period, prefix):
+    dataframe[f"{prefix}_sin"] = np.sin(2 * np.pi * dataframe[source_column] / period)
+    dataframe[f"{prefix}_cos"] = np.cos(2 * np.pi * dataframe[source_column] / period)
+    return dataframe
 
-    feature_df["lag_1"] = feature_df[target_column].shift(1)
-    feature_df["lag_24"] = feature_df[target_column].shift(24)
-    feature_df["rolling_mean_24"] = feature_df[target_column].shift(1).rolling(window=24, min_periods=24).mean()
+
+def build_improved_features(dataframe, timestamp_column, target_column, horizon):
+    feature_df = dataframe.copy()
+    feature_df = feature_df.sort_values(timestamp_column).reset_index(drop=True)
+    feature_df[target_column] = pd.to_numeric(feature_df[target_column], errors="coerce")
+
+    lag_candidates = [1, 2, 4, 8, 24, 48, 96]
+    rolling_windows = [4, 8, 24, 48, 96]
+
+    feature_cols = []
+
+    for lag in lag_candidates:
+        if len(feature_df) > lag:
+            col_name = f"lag_{lag}"
+            feature_df[col_name] = feature_df[target_column].shift(lag)
+            feature_cols.append(col_name)
+
+    shifted_target = feature_df[target_column].shift(1)
+
+    for window in rolling_windows:
+        if len(feature_df) > window:
+            mean_col = f"rolling_mean_{window}"
+            std_col = f"rolling_std_{window}"
+            min_col = f"rolling_min_{window}"
+            max_col = f"rolling_max_{window}"
+
+            feature_df[mean_col] = shifted_target.rolling(window=window, min_periods=max(2, window // 2)).mean()
+            feature_df[std_col] = shifted_target.rolling(window=window, min_periods=max(2, window // 2)).std()
+            feature_df[min_col] = shifted_target.rolling(window=window, min_periods=max(2, window // 2)).min()
+            feature_df[max_col] = shifted_target.rolling(window=window, min_periods=max(2, window // 2)).max()
+            feature_cols.extend([mean_col, std_col, min_col, max_col])
+
+    feature_df["diff_1"] = feature_df[target_column].diff(1).shift(1)
+    feature_df["diff_4"] = feature_df[target_column].diff(4).shift(1)
+    feature_df["target_expanding_mean"] = shifted_target.expanding(min_periods=10).mean()
+    feature_cols.extend(["diff_1", "diff_4", "target_expanding_mean"])
 
     feature_df["hour"] = feature_df[timestamp_column].dt.hour
-    feature_df["weekend"] = feature_df[timestamp_column].dt.dayofweek.isin([5, 6]).astype(int)
+    feature_df["dayofweek"] = feature_df[timestamp_column].dt.dayofweek
+    feature_df["weekend"] = feature_df["dayofweek"].isin([5, 6]).astype(int)
     feature_df["month"] = feature_df[timestamp_column].dt.month
+    feature_df["dayofyear"] = feature_df[timestamp_column].dt.dayofyear
+    feature_df["is_daylight_hour"] = feature_df["hour"].between(6, 18).astype(int)
 
-    feature_df["y_target"] = feature_df[target_column].shift(-horizon)
+    feature_df = add_cyclical_feature(feature_df, "hour", 24, "hour")
+    feature_df = add_cyclical_feature(feature_df, "dayofweek", 7, "dayofweek")
+    feature_df = add_cyclical_feature(feature_df, "month", 12, "month")
+    feature_df = add_cyclical_feature(feature_df, "dayofyear", 365.25, "dayofyear")
 
-    feature_cols = ["lag_1", "lag_24", "rolling_mean_24", "hour", "weekend", "month"]
-    model_table = feature_df.dropna(subset=feature_cols + ["y_target"]).reset_index(drop=True)
+    time_features = [
+        "hour",
+        "dayofweek",
+        "weekend",
+        "month",
+        "dayofyear",
+        "is_daylight_hour",
+        "hour_sin",
+        "hour_cos",
+        "dayofweek_sin",
+        "dayofweek_cos",
+        "month_sin",
+        "month_cos",
+        "dayofyear_sin",
+        "dayofyear_cos",
+    ]
+    feature_cols.extend(time_features)
+
+    extra_numeric_cols = [
+        col for col in feature_df.select_dtypes(include=[np.number]).columns
+        if col not in feature_cols + [target_column, "y_target"]
+    ]
+
+    for col in extra_numeric_cols:
+        if col.upper() in ["PLANT_ID"] or "ID" in col.upper():
+            continue
+        shifted_col = f"{col}_lag_1"
+        feature_df[shifted_col] = feature_df[col].shift(1)
+        feature_cols.append(shifted_col)
+
+    feature_df["y_target"] = feature_df[target_column].shift(-int(horizon))
+
+    required_cols = feature_cols + ["y_target"]
+    model_table = feature_df.dropna(subset=required_cols).reset_index(drop=True)
+
     X = model_table[feature_cols]
     y = model_table["y_target"]
+
     return model_table, X, y, feature_cols
 
 
@@ -146,6 +278,10 @@ def make_json_safe(value):
         return float(value)
     if isinstance(value, (np.ndarray,)):
         return value.tolist()
+    if isinstance(value, dict):
+        return {key: make_json_safe(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [make_json_safe(item) for item in value]
     return value
 
 
@@ -190,8 +326,8 @@ def call_openrouter(api_key, evidence_json):
     return payload["choices"][0]["message"]["content"]
 
 
-st.title("Mini Project B Starter - Time-Series Forecasting")
-st.caption("Starter app for UTAS Energy Data Analytics. Students must add modeling, evaluation, and dashboard improvements.")
+st.title("Mini Project B - Time-Series Forecasting")
+st.caption("Starter app for UTAS Energy Data Analytics. This version improves feature engineering but still leaves modeling and metrics for the student.")
 
 with st.sidebar:
     st.header("Student information")
@@ -201,7 +337,7 @@ with st.sidebar:
     project_title = st.text_input("Project title", value="Solar Irradiation Forecasting")
     project_goal = st.text_area(
         "Project goal",
-        value="Forecast the target time-series variable using timestamp-based baseline features, then improve the project with student-added models, metrics, and visuals.",
+        value="Forecast solar irradiation using time-series features, rolling statistics, lag features, calendar features, and student-added models and metrics.",
         height=120,
     )
     api_key = get_openrouter_api_key()
@@ -226,7 +362,13 @@ st.dataframe(audit, use_container_width=True)
 left, right = st.columns(2)
 with left:
     st.subheader("Missing percentage")
-    st.dataframe(audit[["column", "missing_percent"]].sort_values("missing_percent", ascending=False).head(10), use_container_width=True)
+    st.dataframe(
+        audit[["column", "missing_percent"]]
+        .sort_values("missing_percent", ascending=False)
+        .head(10),
+        use_container_width=True,
+    )
+
 with right:
     st.subheader("Column types")
     st.dataframe(audit[["column", "dtype", "unique_count"]], use_container_width=True)
@@ -255,7 +397,24 @@ coverage = {
     "rows": len(cleaned),
     "target_missing_after_cleaning": int(cleaned[target_col].isna().sum()),
 }
-st.write("Time coverage", {k: make_json_safe(v) for k, v in coverage.items()})
+
+gap_summary = infer_time_gap_summary(cleaned, timestamp_col)
+outlier_summary = target_outlier_summary(cleaned, target_col)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Cleaned rows", f"{len(cleaned):,}")
+c2.metric("Median gap minutes", "NA" if gap_summary["median_gap_minutes"] is None else f"{gap_summary['median_gap_minutes']:.1f}")
+c3.metric("Possible missing intervals", gap_summary["suspected_missing_intervals"])
+c4.metric("Target outliers %", f"{outlier_summary['outlier_percent']:.2f}%")
+
+with st.expander("Time coverage, missing timestamp check, and outlier check"):
+    st.write("Time coverage", {k: make_json_safe(v) for k, v in coverage.items()})
+    st.write("Timestamp gap summary", gap_summary)
+    st.write("Target outlier summary", outlier_summary)
+    st.info(
+        "Evidence note: suspected missing intervals are identified from unusually large timestamp gaps. "
+        "Outliers use the IQR rule on the selected target column."
+    )
 
 st.header("3. Optional resampling and forecast horizon")
 resampling_choice = st.selectbox(
@@ -264,27 +423,60 @@ resampling_choice = st.selectbox(
     index=0,
     help="Use resampling if the dataset has irregular timestamps or you want a simpler forecasting interval.",
 )
-horizon = st.number_input("Forecast horizon in rows after optional resampling", min_value=1, max_value=168, value=1, step=1)
+
+horizon = st.number_input(
+    "Forecast horizon in rows after optional resampling",
+    min_value=1,
+    max_value=168,
+    value=1,
+    step=1,
+)
 
 prepared = resample_time_series(cleaned, timestamp_col, target_col, resampling_choice)
 prepared = prepared.dropna(subset=[target_col]).reset_index(drop=True)
 
-if len(prepared) < 30:
-    st.error("Not enough rows remain after cleaning/resampling to create baseline features.")
+if len(prepared) < 40:
+    st.error("Not enough rows remain after cleaning/resampling to create improved features.")
     st.stop()
 
 st.write(f"Prepared dataset rows: {len(prepared):,}")
 
-st.header("4. Baseline feature table")
-feature_table, X, y, feature_cols = build_baseline_features(prepared, timestamp_col, target_col, int(horizon))
+st.header("4. Improved feature engineering table")
+feature_table, X, y, feature_cols = build_improved_features(prepared, timestamp_col, target_col, int(horizon))
 
 if feature_table.empty:
     st.error("Feature table is empty. Try a smaller horizon or avoid aggressive resampling.")
     st.stop()
 
-st.write(f"Feature rows: {len(feature_table):,}")
-st.write("Feature columns:", feature_cols)
-st.dataframe(feature_table.head(20), use_container_width=True)
+st.success(f"Feature table created with {len(feature_table):,} rows and {len(feature_cols)} feature columns.")
+
+feature_groups = {
+    "Lag features": [col for col in feature_cols if col.startswith("lag_")],
+    "Rolling statistics": [col for col in feature_cols if col.startswith("rolling_")],
+    "Change/trend features": [col for col in feature_cols if col.startswith("diff_") or col == "target_expanding_mean"],
+    "Calendar/cyclical features": [
+        col for col in feature_cols
+        if col in [
+            "hour", "dayofweek", "weekend", "month", "dayofyear", "is_daylight_hour",
+            "hour_sin", "hour_cos", "dayofweek_sin", "dayofweek_cos",
+            "month_sin", "month_cos", "dayofyear_sin", "dayofyear_cos",
+        ]
+    ],
+    "Shifted external numeric features": [
+        col for col in feature_cols
+        if col.endswith("_lag_1") and not col.startswith("lag_")
+    ],
+}
+
+group_df = pd.DataFrame([
+    {"feature_group": group, "count": len(cols), "features": ", ".join(cols)}
+    for group, cols in feature_groups.items()
+])
+st.subheader("Feature groups")
+st.dataframe(group_df, use_container_width=True)
+
+st.subheader("Feature table preview")
+st.dataframe(feature_table[[timestamp_col, target_col] + feature_cols + ["y_target"]].head(20), use_container_width=True)
 
 st.subheader("Prepared X and y")
 col_x, col_y = st.columns(2)
@@ -296,7 +488,8 @@ with col_y:
     st.dataframe(y.head(10).to_frame(name="y_target"), use_container_width=True)
 
 st.header("5. STUDENT ADDITIONS - MODELING")
-st.info("Add your forecasting models and evaluation metrics below this marker. Create a pandas DataFrame named results_df.")
+st.info("Paste your model training, time-based split, predictions, and metrics below this marker. Create a pandas DataFrame named results_df.")
+
 st.code(
     """
 # STUDENT ADDITIONS - MODELING
@@ -315,7 +508,8 @@ results_df = None
 results_df = None
 
 st.header("6. STUDENT ADDITIONS - DASHBOARD")
-st.info("Add extra plots, KPIs, forecast comparisons, and written insights below this marker.")
+st.info("Paste additional plots, KPIs, forecast comparisons, and written insights below this marker.")
+
 st.code(
     """
 # STUDENT ADDITIONS - DASHBOARD
@@ -329,7 +523,8 @@ st.code(
     language="python",
 )
 
-with st.expander("Starter target plot"):
+st.subheader("Starter dashboard visuals")
+with st.expander("Target over time"):
     plot_df = prepared[[timestamp_col, target_col]].tail(500)
     fig, ax = plt.subplots()
     ax.plot(plot_df[timestamp_col], plot_df[target_col])
@@ -337,6 +532,26 @@ with st.expander("Starter target plot"):
     ax.set_ylabel(target_col)
     ax.set_title(f"Recent {target_col} values")
     fig.autofmt_xdate()
+    st.pyplot(fig)
+
+with st.expander("Target distribution"):
+    fig, ax = plt.subplots()
+    ax.hist(prepared[target_col].dropna(), bins=30)
+    ax.set_xlabel(target_col)
+    ax.set_ylabel("Count")
+    ax.set_title(f"Distribution of {target_col}")
+    st.pyplot(fig)
+
+with st.expander("Average target by hour"):
+    hourly_profile = prepared.copy()
+    hourly_profile["hour"] = hourly_profile[timestamp_col].dt.hour
+    hourly_profile = hourly_profile.groupby("hour", as_index=False)[target_col].mean()
+
+    fig, ax = plt.subplots()
+    ax.plot(hourly_profile["hour"], hourly_profile[target_col], marker="o")
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel(f"Average {target_col}")
+    ax.set_title(f"Average {target_col} by hour")
     st.pyplot(fig)
 
 st.header("7. Export submission files")
@@ -359,18 +574,26 @@ submission = {
     "prepared_rows": int(len(prepared)),
     "feature_rows": int(len(feature_table)),
     "feature_columns": feature_cols,
+    "feature_groups": feature_groups,
     "time_coverage": {k: make_json_safe(v) for k, v in coverage.items()},
+    "timestamp_gap_summary": gap_summary,
+    "target_outlier_summary": outlier_summary,
     "evidence_flags": {
         "has_dataset_preview": True,
         "has_dataset_audit": True,
         "has_timestamp_selection": bool(timestamp_col),
         "has_target_selection": bool(target_col),
         "has_baseline_features": True,
+        "has_improved_feature_engineering": True,
+        "has_lag_features": len(feature_groups["Lag features"]) > 0,
+        "has_rolling_features": len(feature_groups["Rolling statistics"]) > 0,
+        "has_cyclical_time_features": len(feature_groups["Calendar/cyclical features"]) > 0,
+        "has_external_numeric_features": len(feature_groups["Shifted external numeric features"]) > 0,
         "has_metrics_table": has_metrics_table,
         "has_student_modeling_additions": False,
         "has_student_dashboard_additions": False,
-        "discusses_missing_timestamps": False,
-        "discusses_outliers": False,
+        "discusses_missing_timestamps": True,
+        "discusses_outliers": True,
         "discusses_resampling": resampling_choice != "No resampling",
         "has_insights": False,
     },
@@ -395,9 +618,16 @@ project_card = f"""# {project_title}
 - Cleaned rows: {len(cleaned):,}
 - Prepared rows: {len(prepared):,}
 
-## Feature preparation
-Baseline features prepared:
-{", ".join(feature_cols)}
+## Time-series integrity checks
+- Median timestamp gap in minutes: {gap_summary["median_gap_minutes"]}
+- Largest timestamp gap in minutes: {gap_summary["largest_gap_minutes"]}
+- Suspected missing timestamp intervals: {gap_summary["suspected_missing_intervals"]}
+- Duplicate timestamps: {gap_summary["duplicate_timestamps"]}
+- Target outlier percent by IQR rule: {outlier_summary["outlier_percent"]:.2f}%
+
+## Improved feature preparation
+Feature groups:
+{group_df.to_markdown(index=False)}
 
 ## Student additions needed
 Add modeling, evaluation metrics, dashboard improvements, and written insights before final submission.
@@ -414,6 +644,7 @@ with col1:
         file_name="submission.json",
         mime="application/json",
     )
+
 with col2:
     st.download_button(
         "Download project_card.md",
